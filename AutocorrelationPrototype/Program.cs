@@ -1,6 +1,7 @@
 ﻿using NAudio.Wave;
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -12,36 +13,38 @@ namespace AutocorrelationPrototype
     {
         static void Main(string[] args)
         {
-            //Mp3FileReader reader = new Mp3FileReader(@"C:\data\acm_mirum_tempo\8439655.clip.mp3");
-            Mp3FileReader reader = new Mp3FileReader(@"C:\tmp\100bpm_click.mp3");
-            var sampleProvider = reader.ToSampleProvider().ToMono();
-            var data = new float[44100 * 30];
-            sampleProvider.Read(data, 0, data.Length);
+            var baseDir = @"C:\data\acm_mirum_tempo";
+            var resultFile = "results.txt";
 
-            var novelty = extractNovelty(data.ToArray());
+            var labels = File.ReadAllLines(Path.Combine(baseDir, "labels.txt")).Select(l => l.Split('\t')).ToDictionary(arr => arr[0], arr => float.Parse(arr[1], CultureInfo.InvariantCulture));
 
-            using (var writer = new WaveFileWriter(@"C:\\tmp\\novelty.wav", WaveFormat.CreateIeeeFloatWaveFormat(44100, 1)))
+            using (var resultStream = File.AppendText(Path.Combine(baseDir, resultFile)))
             {
-                writer.WriteSamples(novelty, 0, novelty.Length);
+                resultStream.WriteLine($"filename\tlabel\tresult\tentropy");
+                foreach (var item in labels)
+                {
+                    Mp3FileReader reader = new Mp3FileReader(Path.Combine(baseDir, item.Key));
+
+                    var sampleRate = reader.WaveFormat.SampleRate;
+                    var lengthSeconds = reader.TotalTime.TotalSeconds;
+                    var sampleProvider = reader.ToSampleProvider().ToMono();
+                    var data = new float[(int)(sampleRate * lengthSeconds)];
+                    sampleProvider.Read(data, 0, data.Length);
+                    var novelty = extractNovelty(data.ToArray(), sampleRate);
+
+                    var (autoCorrelation, bpm) = autocorrelate(novelty, sampleRate);
+                    var ent = entropy(autoCorrelation);
+                    resultStream.WriteLine($"{item.Key}\t{item.Value}\t{bpm}\t{ent}");
+                }
             }
-
-
-
-            var correlation = autocorrelate(novelty);
-
-            using (var writer = new WaveFileWriter(@"C:\\tmp\\correlation.wav", WaveFormat.CreateIeeeFloatWaveFormat(44100, 1)))
-            {
-                writer.WriteSamples(correlation, 0, correlation.Length);
-            }
-
         }
 
-        private static float[] extractNovelty(float[] data)
+        private static float[] extractNovelty(float[] data, int sampleRate)
         {
             for (int i = 0; i < data.Length; i++)
                 data[i] = Math.Abs(data[i]);
 
-            var smoothing = new MovingAverage(4410);
+            var smoothing = new MovingAverage(sampleRate / 10);
 
             float prevValue = 0;
 
@@ -59,38 +62,43 @@ namespace AutocorrelationPrototype
             return data;
         }
 
-        private static float[] autocorrelate(float[] novelty)
+        private static (float[] values, float bpm) autocorrelate(float[] novelty, int sampleRate)
         {
-            novelty = aggregate(novelty, 63, (f1, f2) => Math.Max(Math.Abs(f1), f2));
+            int targetRate = 700;
 
+            novelty = aggregate(novelty, sampleRate / targetRate, (f1, f2) => Math.Max(Math.Abs(f1), f2));
             float prevValue = 0;
+
             for (int i = 1; i < novelty.Length; i++)
             {
                 var tmp = novelty[i];
                 novelty[i] -= prevValue;
                 prevValue = tmp;
             }
-
-            int rate = 700;
             
-            int low = rate * 60 / 40;
-            int height = rate * 60 / 260;
-            int beats = 3;
+            int bpmMin = 40;
+            int bpmMax = 260;
 
-            var result = new float[low - height + 1];
+            float bpmStepSize = 0.5f;
 
-            for (int i = low * beats; i < novelty.Length; i++)
+            int beatsWindowSize = 3;
+
+            var result = new float[1 + (int)((bpmMax - bpmMin) / bpmStepSize)];
+
+
+            for(int i = beatsWindowSize * targetRate * 60 / bpmMin; i < novelty.Length; i++)
             {
-                for (int j = low; j >= height; --j)
+                for(int j = 0; j < result.Length; j++)
                 {
+                    int interval = (int)(targetRate * 60 / (bpmMin + j * bpmStepSize));
                     float sum = 0;
 
-                    for (int k = 1; k <= beats; k++)
+                    for(int k = 1; k < beatsWindowSize; k++)
                     {
-                        sum += novelty[i] * novelty[i - j * k];
+                        sum += novelty[i] * novelty[i - interval * k];
                     }
 
-                    result[low - j] += sum / beats;
+                    result[j] += sum;
                 }
             }
 
@@ -99,25 +107,45 @@ namespace AutocorrelationPrototype
 
             for(int i = 0; i < result.Length; ++i)
             {
-                if(result[i] > maxVal)
+                if(result[i] < 0)
+                {
+                    result[i] = 0;
+                }
+                else if(result[i] > maxVal)
                 {
                     maxVal = result[i];
                     maxIndex = i;
                 }
             }
 
-            var bpm = 220f / (low - height) * maxIndex + 40;
+            var bpm = bpmMin + maxIndex * bpmStepSize;
 
-            Console.WriteLine(bpm);
-            Console.ReadKey();
+            return (result, bpm);
+        }
 
+        private static float entropy(float[] data)
+        {
+            for (int i = 0; i < data.Length; i++)
+                data[i] = Math.Abs(data[i]);
 
-            return result;
+            var sum = data.Sum();
+            var result = 0d;
+
+            foreach(var val in data)
+            {
+                if (val > 0)
+                {
+                    var p = val / sum;
+                    result += p * Math.Log(p);
+                }
+            }
+
+            return -(float)result;
         }
 
         private static T[] aggregate<T>(T[] data, int size, Func<T,T,T> aggregation)
         {
-            T[] result = new T[(int)(0.5 + (double)data.Length / size)];
+            T[] result = new T[1 + (data.Length / size)];
 
             for(int i = 0; i < data.Length; i++)
             {
