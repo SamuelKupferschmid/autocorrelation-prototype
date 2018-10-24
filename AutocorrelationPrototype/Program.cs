@@ -11,6 +11,8 @@ namespace AutocorrelationPrototype
 {
     class Program
     {
+        private static string outPath;
+
         static void Main(string[] args)
         {
             var baseDir = @"C:\data\acm_mirum_tempo";
@@ -34,7 +36,10 @@ namespace AutocorrelationPrototype
 
                     var (autoCorrelation, bpm) = autocorrelate(novelty, sampleRate);
                     var ent = entropy(autoCorrelation);
-                    resultStream.WriteLine($"{item.Key}\t{item.Value}\t{bpm}\t{ent}");
+                    var log = $"{item.Key}\t{item.Value}\t{bpm}\t{ent}";
+                    Console.WriteLine(log);
+                    resultStream.WriteLine(log);
+                    resultStream.Flush();
                 }
             }
         }
@@ -154,6 +159,14 @@ namespace AutocorrelationPrototype
             }
 
             return result;
+        }
+
+        private static void writeWave(string filename, float[] data, int sampleRate)
+        {
+            using (var writer = new WaveFileWriter(Path.Combine(outPath, filename), WaveFormat.CreateIeeeFloatWaveFormat(sampleRate, 1)))
+            {
+                writer.WriteSamples(data, 0, data.Length);
+            }
         }
     }
 }
